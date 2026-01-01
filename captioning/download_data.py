@@ -5,12 +5,27 @@ Download full ContraStyles dataset (500k images) using img2dataset.
 This downloads all images locally and preserves ALL original metadata columns
 including: key, md5, tags, merged_tags.
 
+After downloading:
+1. Validates all images and removes corrupt files
+2. Generates metadata.csv with only valid images
+
 Estimated size: ~150-300GB depending on image sizes.
 
 Usage:
-    python download_data.py                     # Download to default location
-    python download_data.py --output ./data     # Custom output directory
-    python download_data.py --threads 32        # Fewer parallel downloads
+    # Download dataset (includes validation + cleanup)
+    python download_data.py --output ./data/contrastyles_full
+
+    # Custom settings
+    python download_data.py --output ./data --threads 32 --timeout 60
+
+    # Regenerate metadata only (after download complete)
+    python download_data.py --output ./data --regenerate-metadata
+
+    # Regenerate with validation (filter corrupt, don't delete)
+    python download_data.py --output ./data --regenerate-metadata --validate
+
+    # Regenerate with validation + cleanup (delete corrupt files)
+    python download_data.py --output ./data --regenerate-metadata --validate --clean
 """
 
 import os
@@ -75,16 +90,62 @@ def download_dataset(output_dir: str, threads: int = 64, timeout: int = 30):
     print(f"  Running: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
 
-    print("\nStep 4: Creating unified metadata parquet...")
+    print("\nStep 4: Validating images and removing corrupt files...")
+    valid_keys = validate_and_clean_images(images_dir)
+
+    print("\nStep 5: Creating unified metadata parquet...")
     create_unified_metadata(output_dir, images_dir, full_metadata_path)
 
-    print("\nStep 5: Generating metadata.csv for training...")
-    generate_metadata(output_dir, images_dir, metadata_path)
+    print("\nStep 6: Generating metadata.csv for training...")
+    generate_metadata(output_dir, images_dir, metadata_path, valid_keys=valid_keys)
 
     print(f"\nDone! Dataset saved to {output_dir}")
     print(f"  - Images: {images_dir}")
     print(f"  - Full metadata: {full_metadata_path}")
     print(f"  - Training metadata: {metadata_path}")
+
+
+def validate_and_clean_images(images_dir: str) -> set:
+    """Validate all downloaded images and remove corrupt ones.
+
+    Returns:
+        Set of valid image keys (filename without extension)
+    """
+    from PIL import Image
+
+    # Find all image files
+    image_files = []
+    for ext in ["*.jpg", "*.jpeg", "*.png", "*.webp"]:
+        image_files.extend(glob.glob(os.path.join(images_dir, "**", ext), recursive=True))
+
+    print(f"  Found {len(image_files)} image files to validate")
+
+    valid_keys = set()
+    corrupt_count = 0
+
+    for i, img_path in enumerate(image_files):
+        if i % 50000 == 0 and i > 0:
+            print(f"  Validated {i}/{len(image_files)}... valid={len(valid_keys)}, corrupt={corrupt_count}")
+
+        try:
+            with Image.open(img_path) as img:
+                img.load()  # Force full decode
+                img.convert('RGB')  # Ensure can convert to RGB
+
+            # Image is valid
+            key = os.path.splitext(os.path.basename(img_path))[0]
+            valid_keys.add(key)
+        except Exception:
+            # Remove corrupt image and its associated files
+            corrupt_count += 1
+            base_path = os.path.splitext(img_path)[0]
+            for ext in ['.jpg', '.jpeg', '.png', '.webp', '.txt', '.json']:
+                path = base_path + ext
+                if os.path.exists(path):
+                    os.remove(path)
+
+    print(f"  Validation complete: {len(valid_keys)} valid, {corrupt_count} corrupt (removed)")
+    return valid_keys
 
 
 def create_unified_metadata(output_dir: str, images_dir: str, output_path: str):
@@ -113,50 +174,158 @@ def create_unified_metadata(output_dir: str, images_dir: str, output_path: str):
         print(f"  Columns: {combined.columns.tolist()}")
 
 
-def generate_metadata(output_dir: str, images_dir: str, metadata_path: str):
-    """Generate metadata.csv from downloaded images."""
+def generate_metadata(output_dir: str, images_dir: str, metadata_path: str,
+                      valid_keys: set = None, validate_images: bool = False):
+    """Generate metadata.csv from downloaded images.
 
-    # Find all downloaded images
-    image_files = []
-    for ext in ["*.jpg", "*.jpeg", "*.png", "*.webp"]:
-        image_files.extend(glob.glob(os.path.join(images_dir, "**", ext), recursive=True))
+    Args:
+        output_dir: Base output directory
+        images_dir: Directory containing downloaded images
+        metadata_path: Path to save metadata.csv
+        valid_keys: Pre-validated set of image keys (skips validation if provided)
+        validate_images: If True and valid_keys not provided, verify each image can be loaded
+    """
+    from PIL import Image
 
-    print(f"  Found {len(image_files)} downloaded images")
-
-    # Load metadata from shard parquets (includes original_key now)
+    # Load metadata from shard parquets - only successful downloads
     shard_parquets = sorted(glob.glob(os.path.join(images_dir, "*.parquet")))
+    print(f"  Found {len(shard_parquets)} shard parquets")
 
-    key_to_data = {}
+    # Combine all shards efficiently
+    dfs = []
     for pq in shard_parquets:
         try:
             df = pd.read_parquet(pq)
-            for _, row in df.iterrows():
-                key_to_data[row["key"]] = {
-                    "caption": row.get("caption", ""),
-                    "original_key": row.get("original_key", ""),
-                    "tags": row.get("tags", ""),
-                }
+            # Only keep successful downloads
+            df = df[df['status'] == 'success'][['key', 'caption']]
+            dfs.append(df)
         except Exception as e:
             print(f"  Warning: Could not read {pq}: {e}")
 
-    # Match images to captions
-    records = []
-    for img_path in image_files:
-        basename = os.path.basename(img_path)
-        key = os.path.splitext(basename)[0]
-        rel_path = os.path.relpath(img_path, output_dir)
+    if not dfs:
+        print("  No shard parquets found!")
+        return
 
-        data = key_to_data.get(key, {})
-        caption = data.get("caption", "")
-        if caption:
-            records.append({
-                "video": rel_path,
-                "prompt": caption,
-            })
+    combined = pd.concat(dfs, ignore_index=True)
+    print(f"  Loaded {len(combined)} successful downloads from parquets")
+
+    # Build key->caption dict
+    key_to_caption = dict(zip(combined['key'], combined['caption']))
+
+    # If valid_keys provided, use them directly
+    if valid_keys is not None:
+        print(f"  Using {len(valid_keys)} pre-validated image keys")
+        records = []
+        missing = 0
+        for key in valid_keys:
+            caption = key_to_caption.get(key)
+            if not caption:
+                missing += 1
+                continue
+            # Find the image file for this key
+            for ext in ['jpg', 'jpeg', 'png', 'webp']:
+                # img2dataset uses shard folders like 00000, 00001, etc.
+                shard = key[:5]
+                img_path = os.path.join(images_dir, shard, f"{key}.{ext}")
+                if os.path.exists(img_path):
+                    rel_path = os.path.relpath(img_path, output_dir)
+                    records.append({"video": rel_path, "prompt": caption})
+                    break
+        print(f"  Matched {len(records)} images with captions")
+        if missing > 0:
+            print(f"  Skipped {missing} images without captions in parquet")
+    else:
+        # Find all downloaded images
+        image_files = []
+        for ext in ["*.jpg", "*.jpeg", "*.png", "*.webp"]:
+            image_files.extend(glob.glob(os.path.join(images_dir, "**", ext), recursive=True))
+        print(f"  Found {len(image_files)} downloaded image files")
+
+        # Match images to captions
+        records = []
+        missing = 0
+        corrupt = 0
+
+        for i, img_path in enumerate(image_files):
+            if i % 50000 == 0 and i > 0:
+                print(f"  Processed {i}/{len(image_files)}... valid={len(records)}")
+
+            basename = os.path.basename(img_path)
+            key = os.path.splitext(basename)[0]
+
+            caption = key_to_caption.get(key)
+            if not caption:
+                missing += 1
+                continue
+
+            # Optionally validate image integrity
+            if validate_images:
+                try:
+                    with Image.open(img_path) as img:
+                        img.load()
+                        img.convert('RGB')
+                except Exception:
+                    corrupt += 1
+                    continue
+
+            rel_path = os.path.relpath(img_path, output_dir)
+            records.append({"video": rel_path, "prompt": caption})
+
+        if missing > 0:
+            print(f"  Skipped {missing} images without captions")
+        if corrupt > 0:
+            print(f"  Skipped {corrupt} corrupt images")
 
     df = pd.DataFrame(records)
     df.to_csv(metadata_path, index=False)
     print(f"  Saved {len(df)} entries to {metadata_path}")
+
+
+def regenerate_metadata_only(output_dir: str, validate: bool = False, clean: bool = False):
+    """Regenerate metadata.csv without re-downloading images.
+
+    Args:
+        output_dir: Dataset directory
+        validate: Validate image integrity
+        clean: Remove corrupt images (requires validate=True)
+    """
+    images_dir = os.path.join(output_dir, "images")
+    metadata_path = os.path.join(output_dir, "metadata.csv")
+
+    print(f"Regenerating metadata for {output_dir}...")
+
+    valid_keys = None
+    if validate:
+        print("\nValidating images...")
+        if clean:
+            valid_keys = validate_and_clean_images(images_dir)
+        else:
+            # Validate but don't remove corrupt files
+            from PIL import Image
+            image_files = []
+            for ext in ["*.jpg", "*.jpeg", "*.png", "*.webp"]:
+                image_files.extend(glob.glob(os.path.join(images_dir, "**", ext), recursive=True))
+
+            print(f"  Found {len(image_files)} image files to validate")
+            valid_keys = set()
+            corrupt_count = 0
+
+            for i, img_path in enumerate(image_files):
+                if i % 50000 == 0 and i > 0:
+                    print(f"  Validated {i}/{len(image_files)}... valid={len(valid_keys)}, corrupt={corrupt_count}")
+                try:
+                    with Image.open(img_path) as img:
+                        img.load()
+                        img.convert('RGB')
+                    key = os.path.splitext(os.path.basename(img_path))[0]
+                    valid_keys.add(key)
+                except Exception:
+                    corrupt_count += 1
+
+            print(f"  Validation complete: {len(valid_keys)} valid, {corrupt_count} corrupt")
+
+    generate_metadata(output_dir, images_dir, metadata_path, valid_keys=valid_keys, validate_images=False)
+    print("Done!")
 
 
 def main():
@@ -167,9 +336,19 @@ def main():
                         help="Number of parallel download threads")
     parser.add_argument("--timeout", type=int, default=30,
                         help="Timeout for each download (seconds)")
+    parser.add_argument("--regenerate-metadata", action="store_true",
+                        help="Only regenerate metadata.csv without downloading")
+    parser.add_argument("--validate", action="store_true",
+                        help="Validate image integrity when regenerating metadata")
+    parser.add_argument("--clean", action="store_true",
+                        help="Remove corrupt images (use with --validate)")
 
     args = parser.parse_args()
-    download_dataset(args.output, args.threads, args.timeout)
+
+    if args.regenerate_metadata:
+        regenerate_metadata_only(args.output, validate=args.validate, clean=args.clean)
+    else:
+        download_dataset(args.output, args.threads, args.timeout)
 
 
 if __name__ == "__main__":
