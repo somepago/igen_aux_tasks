@@ -37,6 +37,7 @@ python download_data.py --output ./data/contrastyles_full
 |------|-------------|
 | `batched_image_inference.py` | Main captioning script |
 | `download_data.py` | Download ContraStyles dataset with all metadata |
+| `rebuild_metadata.py` | Validate images, remove corrupt files, rebuild metadata.csv |
 | `test_pipeline.py` | Test script for validation |
 | `run_captioning.sh` | Convenience bash script |
 | `setup.sh` | Environment setup script |
@@ -239,9 +240,49 @@ Approximate time for full dataset (395K images):
 
 To speed up: run on multiple machines with different shard ranges.
 
+## Post-Download Cleanup
+
+After downloading images, some may be corrupt (truncated downloads, bad headers, etc.). Use the cleanup script to:
+1. Validate all images
+2. Remove corrupt images
+3. Rebuild metadata.csv to match valid images
+
+### Running the Cleanup
+
+```bash
+# Run the cleanup script with path to data directory
+python rebuild_metadata.py /path/to/data/contrastyles_full
+
+# Or navigate to the data directory and run without arguments
+cd /path/to/data/contrastyles_full
+python /path/to/igen_aux_tasks/captioning/rebuild_metadata.py
+```
+
+The script uses 16 parallel workers for fast validation.
+
+### What the Cleanup Does
+
+1. **Validates images**: Opens each image with PIL to verify it's not corrupt
+2. **Removes corrupt images**: Deletes broken images and their corresponding JSON files
+3. **Rebuilds metadata.csv**: Creates a new CSV with only valid images and their captions
+4. **Logs corrupt files**: Saves a list of removed files to `corrupt_images.log`
+
+### Expected Results
+
+After a typical download:
+- ~8% of images may be corrupt (PNG files saved as .jpg, truncated downloads)
+- The script will remove these and update metadata.csv accordingly
+
+### Output Files
+
+| File | Description |
+|------|-------------|
+| `metadata.csv` | Updated CSV with valid images only (video, prompt columns) |
+| `corrupt_images.log` | Log of removed corrupt images with error messages |
+
 ## Dataset Information
 
 - **Source**: [tomg-group-umd/ContraStyles](https://huggingface.co/datasets/tomg-group-umd/ContraStyles)
-- **Size**: ~395K images (after download failures)
+- **Size**: ~395K images (after download failures), ~364K after cleanup
 - **Shards**: 50 directories (00000-00049)
 - **Organization**: Each shard has images, JSON metadata, and parquet files
